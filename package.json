@@ -1,0 +1,32 @@
+{
+  "name": "@victor-software-house/pi-ghostty-theme-sync",
+  "version": "0.1.0",
+  "description": "Sync pi theme with Ghostty terminal colors (fork of @ogulcancelik/pi-ghostty-theme-sync)",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ghostty",
+    "theme",
+    "coding-agent"
+  ],
+  "author": "Victor",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/victor-software-house/pi-ghostty-theme-sync.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
