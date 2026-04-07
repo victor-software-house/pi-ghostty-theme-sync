@@ -16,7 +16,7 @@ import { Container, Key, SelectList, Text, type SelectItem, matchesKey } from "@
 const CMUX_THEME_DIR = "/Applications/cmux.app/Contents/Resources/ghostty/themes";
 const PI_THEMES_DIR = join(homedir(), ".pi", "agent", "themes");
 const PREVIEW_THEME_PREFIX = "ghostty-sync-preview-";
-const THROTTLE_INTERVAL_MS = 100;
+const DEBOUNCE_MS = 80;
 
 type FilterMode = "all" | "dark" | "light";
 
@@ -394,16 +394,6 @@ function writeAndSetPiTheme(ctx: SessionContext, colors: CmuxColors, sourceTheme
 	return themeName;
 }
 
-function writeAndSetPreviewTheme(ctx: SessionContext, colors: CmuxColors, sourceThemeName: string): void {
-	ensureThemesDir();
-	const slug = slugifyThemeName(sourceThemeName);
-	const previewName = `${PREVIEW_THEME_PREFIX}${slug}`;
-	const previewPath = join(PI_THEMES_DIR, `${previewName}.json`);
-	const previewJson = generatePiTheme(colors, previewName);
-	writeFileSync(previewPath, JSON.stringify(previewJson, null, 2));
-	ctx.ui.setTheme(previewName);
-}
-
 function isPrintableInput(data: string): boolean {
 	return data.length === 1 && data >= " " && data !== "\x7f";
 }
@@ -449,53 +439,85 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 	let searchText = "";
 	let selectedTheme = originalCmuxTheme && entryByName.has(originalCmuxTheme) ? originalCmuxTheme : entries[0]!.name;
 
-	let previewTimer: ReturnType<typeof setTimeout> | null = null;
-	let lastPreviewFired = 0;
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 	let pendingThemeName: string | null = null;
 	let lastPreviewName: string | null = null;
 	let closed = false;
+	// Tracks which preview JSON files have already been written this session.
+	const prewritten = new Set<string>();
 
-	const clearThrottle = (): void => {
-		if (previewTimer) {
-			clearTimeout(previewTimer);
-			previewTimer = null;
+	const clearDebounce = (): void => {
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+			debounceTimer = null;
 		}
 		pendingThemeName = null;
 	};
 
+	// Write the preview JSON immediately in the background (setImmediate = next
+	// I/O tick, non-blocking). By the time the debounce fires the file is ready.
+	const prewriteTheme = (themeName: string): void => {
+		if (closed || prewritten.has(themeName)) return;
+		const entry = entryByName.get(themeName);
+		if (!entry) return;
+		setImmediate(() => {
+			if (closed || prewritten.has(themeName)) return;
+			try {
+				ensureThemesDir();
+				const slug = slugifyThemeName(themeName);
+				const previewName = `${PREVIEW_THEME_PREFIX}${slug}`;
+				const previewPath = join(PI_THEMES_DIR, `${previewName}.json`);
+				const json = generatePiTheme(entry.colors, previewName);
+				writeFileSync(previewPath, JSON.stringify(json, null, 2));
+				prewritten.add(themeName);
+			} catch {
+				// Best-effort — applyPreview will fallback to sync write
+			}
+		});
+	};
+
+	// Called when the debounce settles. File is already written; setTheme and
+	// cmux execute back-to-back with no I/O — minimal gap between the two.
 	const applyPreview = (themeName: string): void => {
 		if (closed || themeName === lastPreviewName) return;
 		const entry = entryByName.get(themeName);
 		if (!entry) return;
 		lastPreviewName = themeName;
-		// Both fire concurrently — setTheme is sync, cmux is fire-and-forget
-		writeAndSetPreviewTheme(ctx, entry.colors, themeName);
+		const slug = slugifyThemeName(themeName);
+		const previewName = `${PREVIEW_THEME_PREFIX}${slug}`;
+		// Fallback sync write if prewrite lost the race (e.g. first keypress).
+		if (!prewritten.has(themeName)) {
+			ensureThemesDir();
+			const previewPath = join(PI_THEMES_DIR, `${previewName}.json`);
+			const json = generatePiTheme(entry.colors, previewName);
+			writeFileSync(previewPath, JSON.stringify(json, null, 2));
+			prewritten.add(themeName);
+		}
+		// Both back-to-back in the same sync block — minimum gap between pi and cmux.
+		ctx.ui.setTheme(previewName);
 		runCmuxThemeSet(themeName);
 	};
 
-	// Always deferred — never blocks the input handler's call stack.
-	// delay=0 when cold (next tick, ~1ms), throttle interval when warm.
+	// True debounce — resets the timer on every keypress.
+	// File write is fired immediately in the background (prewriteTheme);
+	// setTheme + cmux only fire once the user pauses for DEBOUNCE_MS.
 	const schedulePreview = (themeName: string): void => {
 		if (closed) return;
 		pendingThemeName = themeName;
-		if (previewTimer) return; // timer pending, will pick up latest pendingThemeName
-
-		const elapsed = Date.now() - lastPreviewFired;
-		const delay = elapsed >= THROTTLE_INTERVAL_MS ? 0 : THROTTLE_INTERVAL_MS - elapsed;
-
-		previewTimer = setTimeout(() => {
-			previewTimer = null;
-			lastPreviewFired = Date.now();
+		prewriteTheme(themeName); // Background write — non-blocking
+		if (debounceTimer) clearTimeout(debounceTimer);
+		debounceTimer = setTimeout(() => {
+			debounceTimer = null;
 			const name = pendingThemeName;
 			pendingThemeName = null;
 			if (name) applyPreview(name);
-		}, delay);
+		}, DEBOUNCE_MS);
 	};
 
 	const closeWithConfirm = (themeName: string, done: (value: void) => void): void => {
 		if (closed) return;
 		closed = true;
-		clearThrottle();
+		clearDebounce();
 		removePreviewThemeFile();
 
 		const entry = entryByName.get(themeName);
@@ -513,7 +535,7 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 	const closeWithCancel = (done: (value: void) => void): void => {
 		if (closed) return;
 		closed = true;
-		clearThrottle();
+		clearDebounce();
 		removePreviewThemeFile();
 
 		if (originalPiTheme) {
