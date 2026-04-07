@@ -136,16 +136,22 @@ let gen = 0;
 let timer: Timer;
 
 function onHighlight(name: string) {
-  gen++;
+  gen++;                        // invalidate any in-flight work
+  clearTimeout(timer);          // cancel pending debounce
   const myGen = gen;
-  clearTimeout(timer);
-  timer = setTimeout(() => {
-    if (myGen !== gen) return;  // superseded during debounce window
-    const theme = cache.get(name) ?? generateAndCache(name);
-    ctx.ui.setTheme(theme);                          // sync
-    execAsync(`cmux themes set "${name}"`).catch(noop); // async, no await
+  timer = setTimeout(() => {    // returns immediately
+    (async () => {              // fully async from here — nothing blocks
+      if (myGen !== gen) return;
+      const theme = cache.get(name) ?? await generateAndCacheAsync(name);
+      if (myGen !== gen) return; // re-check after async file read
+      ctx.ui.setTheme(theme);    // sync repaint — intentional, this IS the update
+      execAsync(`cmux themes set "${name}"`).catch(noop);
+    })();
   }, 80);
 }
+// onHighlight returns immediately. Zero blocking. All work is in the async IIFE.
+// File I/O (readFile) is async. Only ctx.ui.setTheme() is sync (intentional repaint).
+// Generation counter checked after every await to bail on stale work.
 ```
 
 ### Flow
