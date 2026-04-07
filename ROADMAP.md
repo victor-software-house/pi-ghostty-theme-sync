@@ -4,11 +4,11 @@ Fork of `@ogulcancelik/pi-ghostty-theme-sync`.
 
 ## Current state (v0.1.0, upstream)
 
-On `session_start`, reads Ghostty's active config via `ghostty +show-config`, parses bg/fg + 16-color ANSI palette, generates a pi theme JSON, writes it to `~/.pi/agent/themes/ghostty-sync-{hash}.json`, and calls `ctx.ui.setTheme()`. One-directional: Ghostty → pi. No runtime interaction after startup.
+On `session_start`, reads cmux's active config via `ghostty +show-config`, parses bg/fg + 16-color ANSI palette, generates a pi theme JSON, writes it to `~/.pi/agent/themes/ghostty-sync-{hash}.json`, and calls `ctx.ui.setTheme()`. One-directional: cmux → pi. No runtime interaction after startup.
 
 ## Architecture notes
 
-### Theme change flow (Ghostty → pi)
+### Theme change flow (cmux → pi)
 
 ```
 ghostty +show-config  →  parse colors  →  generate pi theme JSON
@@ -16,22 +16,21 @@ ghostty +show-config  →  parse colors  →  generate pi theme JSON
                                           →  ctx.ui.setTheme(name)
 ```
 
-### Theme change flow (pi → Ghostty, planned)
+### Theme change flow (pi → cmux, planned — Phase 2)
 
 ```
 user picks theme in /ghostty TUI  →  cmux themes set "{name}"
-                                  →  ghostty +show-config (read new palette)
-                                  →  generate pi theme JSON
-                                  →  ctx.ui.setTheme(name) (instant pi repaint)
+                                  →  read theme file from disk (475 bytes)
+                                  →  generate pi theme in-memory
+                                  →  ctx.ui.setTheme(themeObj) (instant pi repaint)
 ```
 
 ### Key APIs
 
 | API | What it does |
 |---|---|
-| `ghostty +show-config` | Dumps resolved Ghostty config (theme name, bg, fg, palette 0-15) |
-| `cmux themes list` | Lists all available Ghostty themes, marks current light/dark |
-| `cmux themes set "Name"` | Changes Ghostty theme live with instant preview |
+| `cmux themes list` | Lists all available themes, marks current light/dark |
+| `cmux themes set "Name"` | Changes theme live with instant preview |
 | `cmux reload-config` | Reloads Ghostty config from disk programmatically |
 | `ctx.ui.setTheme(name \| Theme)` | Sets pi theme instantly (full TUI repaint) |
 | `ctx.ui.getAllThemes()` | Lists available pi themes with paths |
@@ -47,11 +46,11 @@ user picks theme in /ghostty TUI  →  cmux themes set "{name}"
 
 **Problem:** Generated theme files use opaque hashes — `ghostty-sync-18052515` — making it impossible to tell what theme is active.
 
-**Fix:** Extract the `theme = ...` line from `ghostty +show-config` output. Use the actual theme name slugified: `ghostty-sync-twilight`. Fall back to hash only when no named theme is found (raw custom colors).
+**Fix:** Parse `cmux themes list` output to get the current theme name. Use it slugified: `ghostty-sync-twilight`. Fall back to hash only when the theme name can't be determined.
 
 **Changes:**
 - Add `themeName: string | null` to `GhosttyColors` interface
-- Parse `theme = ...` in `parseGhosttyConfig()`
+- Get current theme name from `cmux themes list` (parse "Current dark: ..." line)
 - Slugify: lowercase, replace spaces with dashes, strip non-alphanumeric
 - File name: `ghostty-sync-{slug}.json` (or `ghostty-sync-{hash}.json` fallback)
 - Keep hash internally for change detection (avoid regenerating when colors haven't changed)
@@ -86,14 +85,14 @@ The main feature. A `/ghostty` slash command that opens an interactive theme pic
 
 ### Theme data source
 
-Ghostty ships ~463 theme files at:
+cmux ships ~463 theme files at:
 ```
-/Applications/Ghostty.app/Contents/Resources/ghostty/themes/
+/Applications/cmux.app/Contents/Resources/ghostty/themes/
 ```
 
 Each file is exactly 475 bytes — 16 palette entries + bg/fg/cursor/selection. Simple `key = value` format, trivially parseable. No subprocess needed to read them.
 
-cmux may have its own copy at a similar path under `/Applications/cmux.app/...`. Discover at runtime; fall back to the Ghostty app bundle.
+This extension targets cmux only. No standalone Ghostty fallback.
 
 ### Loading strategy: lazy with in-memory cache
 
