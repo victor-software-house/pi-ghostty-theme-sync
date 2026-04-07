@@ -107,57 +107,60 @@ Since `ctx.ui.setTheme()` only accepts a string name and loads from disk, previe
 - On confirm: rename/copy to `ghostty-sync-{slug}.json` (the permanent file)
 - On cancel: delete the preview file, revert to original theme
 
-### Preview pipeline (leading+trailing throttle, non-blocking)
+### Preview pipeline (deferred throttle, non-blocking)
 
 The preview must update both cmux (terminal) and pi (TUI) simultaneously as the user navigates. The UI must never block or stutter, even during fast scrolling.
 
-**Pattern: leading+trailing throttle.** No external libs. First keypress fires immediately (zero delay). Rapid subsequent presses are coalesced — only the last one fires after 100ms of quiet.
+**Critical constraint:** `applyPreview` must NEVER run synchronously inside `handleInput`. If it does, the cursor update is blocked until after writeFileSync + setTheme complete — the user sees input lag.
+
+**Pattern: always-deferred single timer with variable delay.**
+
+- When cold (no recent preview): `setTimeout(fn, 0)` — fires next tick (~1ms). Cursor renders first, then theme changes.
+- When warm (recent preview): `setTimeout(fn, remaining)` — coalesces rapid presses.
+- Single timer, latest-wins. No separate leading/trailing logic.
+- `pendingThemeName` always holds the most recent request. Timer picks it up when it fires.
 
 **Perceived latency:**
 
 | scenario | pi repaint | cmux repaint |
 |---|---|---|
-| single arrow press | **17ms** (leading, instant) | **40ms** (fire-and-forget) |
-| fast scrolling (held arrow) | 100ms + 17ms = **117ms** (trailing) | 100ms + 40ms = **140ms** |
-
-Both well under the 200ms "instant" threshold. A trailing-only debounce would add 100ms to every single keypress — noticeable and sluggish.
+| single arrow press | **~1ms + 17ms = 18ms** (next tick) | **~1ms + 40ms = 41ms** (concurrent) |
+| fast scrolling (held arrow, 35ms repeat) | fires every ~100ms | fires every ~100ms |
 
 **Implementation:**
 
 ```typescript
-let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+let previewTimer: ReturnType<typeof setTimeout> | null = null;
 let lastPreviewFired = 0;
-const THROTTLE_INTERVAL = 100;
+let pendingThemeName: string | null = null;
 
-function previewTheme(name: string, ctx: ExtensionContext) {
-  const now = Date.now();
-  if (throttleTimer) clearTimeout(throttleTimer);
+const schedulePreview = (themeName: string): void => {
+  if (closed) return;
+  pendingThemeName = themeName;
+  if (previewTimer) return; // timer pending, will pick up latest
 
-  if (now - lastPreviewFired >= THROTTLE_INTERVAL) {
-    // Leading edge: fire immediately on first press / after quiet period
-    lastPreviewFired = now;
-    applyPreview(name, ctx);
-  }
+  const elapsed = Date.now() - lastPreviewFired;
+  const delay = elapsed >= THROTTLE_INTERVAL_MS ? 0 : THROTTLE_INTERVAL_MS - elapsed;
 
-  // Trailing edge: always schedule, so the last value in a burst fires
-  throttleTimer = setTimeout(() => {
-    throttleTimer = null;
+  previewTimer = setTimeout(() => {
+    previewTimer = null;
     lastPreviewFired = Date.now();
-    applyPreview(name, ctx);
-  }, THROTTLE_INTERVAL);
-}
+    const name = pendingThemeName;
+    pendingThemeName = null;
+    if (name) applyPreview(name);
+  }, delay);
+};
 
-function applyPreview(name: string, ctx: ExtensionContext) {
-  const colors = getCmuxThemeColors(name);
-  if (!colors) return;
-  const json = generatePiTheme(colors, "ghostty-sync-preview");
-  writeFileSync(previewPath, JSON.stringify(json, null, 2));  // <1ms
-  ctx.ui.setTheme("ghostty-sync-preview");                    // 16ms, sync
-  exec(`cmux themes set "${name}"`, noop);                     // 40ms, async
+function applyPreview(name: string) {
+  // Both fire concurrently — setTheme is sync, cmux is fire-and-forget
+  writeAndSetPreviewTheme(ctx, entry.colors);   // writeFileSync + setTheme
+  runCmuxThemeSet(name);                         // execFile, async
 }
 ```
 
-**Why no external lib:** The leading+trailing throttle is 15 lines. `perfect-debounce` only does trailing-edge. A throttle lib would add a dependency for no benefit.
+**Why not a leading+trailing throttle:** The leading edge fired synchronously inside handleInput, blocking the render loop. A deferred-only approach with `setTimeout(0)` adds ~1ms latency but guarantees the cursor renders before the theme changes.
+
+**Why no external lib:** The pattern is 15 lines. `perfect-debounce` only does trailing-edge. Throttle libs fire leading-edge synchronously — exactly the problem we're avoiding.
 
 ### Flow
 
