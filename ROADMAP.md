@@ -107,38 +107,57 @@ Since `ctx.ui.setTheme()` only accepts a string name and loads from disk, previe
 - On confirm: rename/copy to `ghostty-sync-{slug}.json` (the permanent file)
 - On cancel: delete the preview file, revert to original theme
 
-### Preview pipeline
+### Preview pipeline (leading+trailing throttle, non-blocking)
 
-```
-onSelectionChange(name)
-  → debounce 100ms (setTimeout + clearTimeout, latest wins)
-  → generate pi theme JSON from cached cmux theme file
-  → writeFileSync("~/.pi/agent/themes/ghostty-sync-preview.json", json)  — <1ms
-  → ctx.ui.setTheme("ghostty-sync-preview")                              — 16ms, sync
-  → exec("cmux themes set {name}")                                       — 40ms, fire-and-forget
-```
+The preview must update both cmux (terminal) and pi (TUI) simultaneously as the user navigates. The UI must never block or stutter, even during fast scrolling.
 
-Total: ~57ms. Debounce at 100ms gives comfortable headroom above p99 (73ms).
+**Pattern: leading+trailing throttle.** No external libs. First keypress fires immediately (zero delay). Rapid subsequent presses are coalesced — only the last one fires after 100ms of quiet.
 
-**Debounce implementation:** Simple `setTimeout` + `clearTimeout`. No external lib needed.
+**Perceived latency:**
+
+| scenario | pi repaint | cmux repaint |
+|---|---|---|
+| single arrow press | **17ms** (leading, instant) | **40ms** (fire-and-forget) |
+| fast scrolling (held arrow) | 100ms + 17ms = **117ms** (trailing) | 100ms + 40ms = **140ms** |
+
+Both well under the 200ms "instant" threshold. A trailing-only debounce would add 100ms to every single keypress — noticeable and sluggish.
+
+**Implementation:**
 
 ```typescript
-let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+let lastPreviewFired = 0;
+const THROTTLE_INTERVAL = 100;
 
 function previewTheme(name: string, ctx: ExtensionContext) {
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => {
-    const colors = getCmuxThemeColors(name);     // readFileSync, 475 bytes
-    if (!colors) return;
-    const json = generatePiTheme(colors, "ghostty-sync-preview");
-    writeFileSync(previewPath, JSON.stringify(json, null, 2));
-    ctx.ui.setTheme("ghostty-sync-preview");     // sync, 16ms
-    exec(`cmux themes set "${name}"`, noop);      // async, fire-and-forget
-  }, 100);
+  const now = Date.now();
+  if (throttleTimer) clearTimeout(throttleTimer);
+
+  if (now - lastPreviewFired >= THROTTLE_INTERVAL) {
+    // Leading edge: fire immediately on first press / after quiet period
+    lastPreviewFired = now;
+    applyPreview(name, ctx);
+  }
+
+  // Trailing edge: always schedule, so the last value in a burst fires
+  throttleTimer = setTimeout(() => {
+    throttleTimer = null;
+    lastPreviewFired = Date.now();
+    applyPreview(name, ctx);
+  }, THROTTLE_INTERVAL);
+}
+
+function applyPreview(name: string, ctx: ExtensionContext) {
+  const colors = getCmuxThemeColors(name);
+  if (!colors) return;
+  const json = generatePiTheme(colors, "ghostty-sync-preview");
+  writeFileSync(previewPath, JSON.stringify(json, null, 2));  // <1ms
+  ctx.ui.setTheme("ghostty-sync-preview");                    // 16ms, sync
+  exec(`cmux themes set "${name}"`, noop);                     // 40ms, async
 }
 ```
 
-**`exec` detail:** Use `child_process.exec(cmd, callback)` (not `execSync`). The callback is a no-op — we don't care about the result. This is non-blocking.
+**Why no external lib:** The leading+trailing throttle is 15 lines. `perfect-debounce` only does trailing-edge. A throttle lib would add a dependency for no benefit.
 
 ### Flow
 
