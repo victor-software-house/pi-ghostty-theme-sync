@@ -1,48 +1,57 @@
 /**
- * Ghostty Theme Sync Extension
+ * cmux Theme Sync Extension
  *
- * Syncs pi theme with Ghostty terminal colors on startup.
- * Uses standard ANSI color slot mapping.
- *
- * ANSI slots (consistent across themes):
- *   0: black    8: bright black (gray/muted)
- *   1: red      9: bright red
- *   2: green   10: bright green
- *   3: yellow  11: bright yellow
- *   4: blue    12: bright blue
- *   5: magenta 13: bright magenta
- *   6: cyan    14: bright cyan
- *   7: white   15: bright white
+ * Syncs pi theme with the currently active cmux terminal theme on session start.
+ * Source of truth is cmux (`cmux themes list`) + cmux bundled theme files.
  */
 
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-interface GhosttyColors {
+const CMUX_THEME_DIR = "/Applications/cmux.app/Contents/Resources/ghostty/themes";
+
+interface CmuxColors {
 	background: string;
 	foreground: string;
 	palette: Record<number, string>;
 }
 
-function getGhosttyColors(): GhosttyColors | null {
+function getCurrentCmuxThemeName(): string | null {
 	try {
-		const output = execSync("ghostty +show-config", {
+		const output = execSync("cmux themes list", {
 			encoding: "utf-8",
 			timeout: 5000,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
-		return parseGhosttyConfig(output);
+		for (const line of output.split("\n")) {
+			if (line.startsWith("Current dark:")) return line.replace("Current dark:", "").trim();
+		}
+		for (const line of output.split("\n")) {
+			if (line.startsWith("Current light:")) return line.replace("Current light:", "").trim();
+		}
+		return null;
 	} catch {
 		return null;
 	}
 }
 
-function parseGhosttyConfig(output: string): GhosttyColors {
-	const colors: GhosttyColors = {
+function getCmuxThemeColors(themeName: string): CmuxColors | null {
+	try {
+		const themePath = join(CMUX_THEME_DIR, themeName);
+		if (!existsSync(themePath)) return null;
+		const output = readFileSync(themePath, "utf-8");
+		return parseThemeConfig(output);
+	} catch {
+		return null;
+	}
+}
+
+function parseThemeConfig(output: string): CmuxColors {
+	const colors: CmuxColors = {
 		background: "#1e1e1e",
 		foreground: "#d4d4d4",
 		palette: {},
@@ -81,9 +90,7 @@ function normalizeColor(color: string): string {
 		}
 		return trimmed;
 	}
-	if (/^[0-9a-fA-F]{6}$/.test(trimmed)) {
-		return `#${trimmed}`;
-	}
+	if (/^[0-9a-fA-F]{6}$/.test(trimmed)) return `#${trimmed}`;
 	return `#${trimmed}`;
 }
 
@@ -121,33 +128,77 @@ function mixColors(color1: string, color2: string, weight: number): string {
 	);
 }
 
-function generatePiTheme(colors: GhosttyColors, themeName: string): object {
+function rgbToHsl(hex: string): { h: number; s: number; l: number } {
+	const { r, g, b } = hexToRgb(hex);
+	const rn = r / 255;
+	const gn = g / 255;
+	const bn = b / 255;
+	const max = Math.max(rn, gn, bn);
+	const min = Math.min(rn, gn, bn);
+	const l = (max + min) / 2;
+	if (max === min) return { h: 0, s: 0, l };
+	const d = max - min;
+	const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+	let h = 0;
+	if (max === rn) h = (gn - bn) / d + (gn < bn ? 6 : 0);
+	else if (max === gn) h = (bn - rn) / d + 2;
+	else h = (rn - gn) / d + 4;
+	h *= 60;
+	return { h, s, l };
+}
+
+function hueDistance(a: number, b: number): number {
+	const d = Math.abs(a - b) % 360;
+	return d > 180 ? 360 - d : d;
+}
+
+function ensureSemanticHue(color: string | undefined, targetHue: number, fallback: string): string {
+	if (!color) return fallback;
+	const { h, s } = rgbToHsl(color);
+	if (s >= 0.2 && hueDistance(h, targetHue) <= 65) return color;
+	return mixColors(color, fallback, 0.5);
+}
+
+function contrastRatio(a: string, b: string): number {
+	const l1 = getLuminance(a);
+	const l2 = getLuminance(b);
+	const lighter = Math.max(l1, l2);
+	const darker = Math.min(l1, l2);
+	return (lighter + 0.05) / (darker + 0.05);
+}
+
+function pickReadableLink(candidate: string, bg: string, fallback: string, fg: string): string {
+	if (contrastRatio(candidate, bg) >= 3) return candidate;
+	if (contrastRatio(fallback, bg) >= 3) return fallback;
+	return fg;
+}
+
+function slugifyThemeName(name: string): string {
+	return name
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+function generatePiTheme(colors: CmuxColors, themeName: string): object {
 	const bg = colors.background;
 	const fg = colors.foreground;
 	const isDark = getLuminance(bg) < 0.5;
 
-	// ANSI color slots - trust the standard for semantic colors.
-	// Note: we intentionally do NOT use palette[0]/palette[8] as "neutral" colors.
-	// Some themes have non-black "black" slots.
-	const error = colors.palette[1] || "#cc6666";
-	const success = colors.palette[2] || "#98c379";
-	const warning = colors.palette[3] || "#e5c07b";
-	const link = colors.palette[4] || "#61afef";
+	const error = ensureSemanticHue(colors.palette[1], 0, "#cc6666");
+	const success = ensureSemanticHue(colors.palette[2], 120, "#98c379");
+	const warning = ensureSemanticHue(colors.palette[3], 50, "#e5c07b");
+	const rawLink = ensureSemanticHue(colors.palette[4], 220, "#61afef");
+	const link = pickReadableLink(rawLink, bg, "#61afef", fg);
 
-	// "Accent" is a judgment call.
 	const accent = colors.palette[5] || "#c678dd";
 	const accentAlt = colors.palette[6] || "#56b6c2";
 
-	// Derive neutrals from bg/fg for consistent readability across themes
 	const muted = mixColors(fg, bg, 0.65);
 	const dim = mixColors(fg, bg, 0.45);
 	const borderMuted = mixColors(fg, bg, 0.25);
 
-	// Keep bg/fg for export and derived backgrounds
-	const _fg = fg;
-	const _bg = bg;
-
-	// Derive backgrounds
 	const bgShift = isDark ? 12 : -12;
 	const selectedBg = adjustBrightness(bg, bgShift);
 	const userMsgBg = adjustBrightness(bg, Math.round(bgShift * 0.7));
@@ -160,8 +211,8 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 		$schema: "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
 		name: themeName,
 		vars: {
-			bg: _bg,
-			fg: _fg,
+			bg,
+			fg,
 			accent,
 			accentAlt,
 			link,
@@ -179,9 +230,8 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 			customMsgBg,
 		},
 		colors: {
-			// Core UI
 			accent: "accent",
-			border: "link",
+			border: "borderMuted",
 			borderAccent: "accent",
 			borderMuted: "borderMuted",
 			success: "success",
@@ -191,8 +241,6 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 			dim: "dim",
 			text: "",
 			thinkingText: "muted",
-
-			// Backgrounds
 			selectedBg: "selectedBg",
 			userMessageBg: "userMsgBg",
 			userMessageText: "",
@@ -204,8 +252,6 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 			toolErrorBg: "toolErrorBg",
 			toolTitle: "",
 			toolOutput: "muted",
-
-			// Markdown
 			mdHeading: "warning",
 			mdLink: "link",
 			mdLinkUrl: "dim",
@@ -216,13 +262,9 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 			mdQuoteBorder: "muted",
 			mdHr: "muted",
 			mdListBullet: "accent",
-
-			// Diffs
 			toolDiffAdded: "success",
 			toolDiffRemoved: "error",
 			toolDiffContext: "muted",
-
-			// Syntax
 			syntaxComment: "muted",
 			syntaxKeyword: "accent",
 			syntaxFunction: "link",
@@ -232,16 +274,12 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 			syntaxType: "accentAlt",
 			syntaxOperator: "fg",
 			syntaxPunctuation: "muted",
-
-			// Thinking levels
 			thinkingOff: "borderMuted",
 			thinkingMinimal: "muted",
 			thinkingLow: "link",
 			thinkingMedium: "accentAlt",
 			thinkingHigh: "accent",
 			thinkingXhigh: "accent",
-
-			// Bash mode
 			bashMode: "success",
 		},
 		export: {
@@ -252,13 +290,11 @@ function generatePiTheme(colors: GhosttyColors, themeName: string): object {
 	};
 }
 
-function computeThemeHash(colors: GhosttyColors): string {
+function computeThemeHash(colors: CmuxColors): string {
 	const parts: string[] = [];
 	parts.push(`bg=${colors.background}`);
 	parts.push(`fg=${colors.foreground}`);
-	for (let i = 0; i <= 15; i++) {
-		parts.push(`p${i}=${colors.palette[i] ?? ""}`);
-	}
+	for (let i = 0; i <= 15; i++) parts.push(`p${i}=${colors.palette[i] ?? ""}`);
 	const signature = parts.join("\n");
 	return createHash("sha1").update(signature).digest("hex").slice(0, 8);
 }
@@ -268,7 +304,6 @@ function cleanupOldGhosttyThemes(themesDir: string, keepFile: string): void {
 		for (const file of readdirSync(themesDir)) {
 			if (file === keepFile) continue;
 			if (file === "ghostty-sync.json") {
-				// Legacy file name from older versions
 				unlinkSync(join(themesDir, file));
 				continue;
 			}
@@ -283,37 +318,30 @@ function cleanupOldGhosttyThemes(themesDir: string, keepFile: string): void {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		const colors = getGhosttyColors();
-		if (!colors) {
-			return;
-		}
+		const currentTheme = getCurrentCmuxThemeName();
+		if (!currentTheme) return;
+
+		const colors = getCmuxThemeColors(currentTheme);
+		if (!colors) return;
 
 		const themesDir = join(homedir(), ".pi", "agent", "themes");
-		if (!existsSync(themesDir)) {
-			mkdirSync(themesDir, { recursive: true });
-		}
+		if (!existsSync(themesDir)) mkdirSync(themesDir, { recursive: true });
 
 		const hash = computeThemeHash(colors);
-		const themeName = `ghostty-sync-${hash}`;
+		const slug = slugifyThemeName(currentTheme);
+		const themeName = slug ? `ghostty-sync-${slug}` : `ghostty-sync-${hash}`;
 		const themeFile = `${themeName}.json`;
 		const themePath = join(themesDir, themeFile);
 
-		// If we're already on the correct synced theme, do nothing.
-		// This avoids an extra full-screen repaint on startup.
-		if (ctx.ui.theme.name === themeName) {
-			return;
-		}
+		if (ctx.ui.theme.name === themeName) return;
 
 		const themeJson = generatePiTheme(colors, themeName);
 		writeFileSync(themePath, JSON.stringify(themeJson, null, 2));
-
-		// Remove old generated themes so the themes dir doesn't grow forever.
 		cleanupOldGhosttyThemes(themesDir, themeFile);
 
-		// Important: set by name, so pi loads from the file we just wrote.
 		const result = ctx.ui.setTheme(themeName);
 		if (!result.success) {
-			ctx.ui.notify(`Ghostty theme sync failed: ${result.error}`, "error");
+			ctx.ui.notify(`cmux theme sync failed: ${result.error}`, "error");
 		}
 	});
 }
