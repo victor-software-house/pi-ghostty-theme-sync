@@ -15,8 +15,7 @@ import { Container, Key, SelectList, Text, type SelectItem, matchesKey } from "@
 
 const CMUX_THEME_DIR = "/Applications/cmux.app/Contents/Resources/ghostty/themes";
 const PI_THEMES_DIR = join(homedir(), ".pi", "agent", "themes");
-const PREVIEW_THEME_NAME = "ghostty-sync-preview";
-const PREVIEW_THEME_FILE = `${PREVIEW_THEME_NAME}.json`;
+const PREVIEW_THEME_PREFIX = "ghostty-sync-preview-";
 const THROTTLE_INTERVAL_MS = 100;
 
 type FilterMode = "all" | "dark" | "light";
@@ -44,7 +43,11 @@ function ensureThemesDir(): void {
 
 function removePreviewThemeFile(): void {
 	try {
-		unlinkSync(join(PI_THEMES_DIR, PREVIEW_THEME_FILE));
+		for (const file of readdirSync(PI_THEMES_DIR)) {
+			if (file.startsWith(PREVIEW_THEME_PREFIX) && file.endsWith(".json")) {
+				unlinkSync(join(PI_THEMES_DIR, file));
+			}
+		}
 	} catch {
 		// Best-effort cleanup
 	}
@@ -391,12 +394,14 @@ function writeAndSetPiTheme(ctx: SessionContext, colors: CmuxColors, sourceTheme
 	return themeName;
 }
 
-function writeAndSetPreviewTheme(ctx: SessionContext, colors: CmuxColors): void {
+function writeAndSetPreviewTheme(ctx: SessionContext, colors: CmuxColors, sourceThemeName: string): void {
 	ensureThemesDir();
-	const previewPath = join(PI_THEMES_DIR, PREVIEW_THEME_FILE);
-	const previewJson = generatePiTheme(colors, PREVIEW_THEME_NAME);
+	const slug = slugifyThemeName(sourceThemeName);
+	const previewName = `${PREVIEW_THEME_PREFIX}${slug}`;
+	const previewPath = join(PI_THEMES_DIR, `${previewName}.json`);
+	const previewJson = generatePiTheme(colors, previewName);
 	writeFileSync(previewPath, JSON.stringify(previewJson, null, 2));
-	ctx.ui.setTheme(PREVIEW_THEME_NAME);
+	ctx.ui.setTheme(previewName);
 }
 
 function isPrintableInput(data: string): boolean {
@@ -464,7 +469,7 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 		if (!entry) return;
 		lastPreviewName = themeName;
 		// Both fire concurrently — setTheme is sync, cmux is fire-and-forget
-		writeAndSetPreviewTheme(ctx, entry.colors);
+		writeAndSetPreviewTheme(ctx, entry.colors, themeName);
 		runCmuxThemeSet(themeName);
 	};
 
