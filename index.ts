@@ -520,7 +520,13 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 		done(undefined);
 	};
 
-	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+	await ctx.ui.custom<void>((tui, _factoryTheme, _keybindings, done) => {
+		// Use ctx.ui.theme (always current) — NOT the factory's theme param.
+		// The factory closure captures the theme at creation time. When setTheme
+		// changes the global theme during preview, the closure's ref goes stale.
+		// ctx.ui.theme always returns the live Theme instance.
+		const t = () => ctx.ui.theme;
+
 		const container = new Container();
 		let selectList: SelectList | null = null;
 
@@ -549,6 +555,7 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 		};
 
 		const rebuild = (): void => {
+			const theme = t(); // Always fresh
 			const visibleEntries = getVisibleEntries();
 			const items = buildSelectItems(visibleEntries);
 
@@ -557,16 +564,17 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 			}
 
 			container.clear();
-			container.addChild(new DynamicBorder((s: string) => theme.fg("borderMuted", s)));
+			container.addChild(new DynamicBorder((s: string) => t().fg("borderMuted", s)));
 			container.addChild(new Text(theme.fg("accent", theme.bold("Ghostty Theme Picker")), 1, 0));
 			container.addChild(new Text(theme.fg("dim", `Mode: ${filterMode} · Search: ${searchText || "—"}`), 1, 0));
 
+			// SelectList theme callbacks use t() so they resolve at render time, not build time
 			selectList = new SelectList(items, 14, {
-				selectedPrefix: (text) => theme.fg("accent", text),
-				selectedText: (text) => theme.fg("accent", text),
-				description: (text) => theme.fg("muted", text),
-				scrollInfo: (text) => theme.fg("dim", text),
-				noMatch: (text) => theme.fg("warning", text),
+				selectedPrefix: (text) => t().fg("accent", text),
+				selectedText: (text) => t().fg("accent", text),
+				description: (text) => t().fg("muted", text),
+				scrollInfo: (text) => t().fg("dim", text),
+				noMatch: (text) => t().fg("warning", text),
 			});
 
 			const selectedIndex = items.findIndex((item) => item.value === selectedTheme);
@@ -589,7 +597,7 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 					0
 				)
 			);
-			container.addChild(new DynamicBorder((s: string) => theme.fg("borderMuted", s)));
+			container.addChild(new DynamicBorder((s: string) => t().fg("borderMuted", s)));
 		};
 
 		rebuild();
@@ -599,7 +607,11 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 
 		return {
 			render: (width: number) => container.render(width),
-			invalidate: () => container.invalidate(),
+			// On theme change: TUI calls invalidate() → rebuild with fresh ctx.ui.theme
+			invalidate: () => {
+				container.invalidate();
+				rebuild();
+			},
 			handleInput: (data: string) => {
 				if (matchesKey(data, Key.tab)) {
 					filterMode = nextFilterMode(filterMode);
