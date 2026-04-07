@@ -444,16 +444,16 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 	let searchText = "";
 	let selectedTheme = originalCmuxTheme && entryByName.has(originalCmuxTheme) ? originalCmuxTheme : entries[0]!.name;
 
-	let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+	let previewTimer: ReturnType<typeof setTimeout> | null = null;
 	let lastPreviewFired = 0;
 	let pendingThemeName: string | null = null;
 	let lastPreviewName: string | null = null;
 	let closed = false;
 
 	const clearThrottle = (): void => {
-		if (throttleTimer) {
-			clearTimeout(throttleTimer);
-			throttleTimer = null;
+		if (previewTimer) {
+			clearTimeout(previewTimer);
+			previewTimer = null;
 		}
 		pendingThemeName = null;
 	};
@@ -462,32 +462,29 @@ async function showThemePicker(ctx: CommandContext): Promise<void> {
 		if (closed || themeName === lastPreviewName) return;
 		const entry = entryByName.get(themeName);
 		if (!entry) return;
+		lastPreviewName = themeName;
+		// Both fire concurrently — setTheme is sync, cmux is fire-and-forget
 		writeAndSetPreviewTheme(ctx, entry.colors);
 		runCmuxThemeSet(themeName);
-		lastPreviewName = themeName;
 	};
 
+	// Always deferred — never blocks the input handler's call stack.
+	// delay=0 when cold (next tick, ~1ms), throttle interval when warm.
 	const schedulePreview = (themeName: string): void => {
 		if (closed) return;
-		const now = Date.now();
-		if (throttleTimer) clearTimeout(throttleTimer);
+		pendingThemeName = themeName;
+		if (previewTimer) return; // timer pending, will pick up latest pendingThemeName
 
-		if (now - lastPreviewFired >= THROTTLE_INTERVAL_MS) {
-			lastPreviewFired = now;
-			applyPreview(themeName);
-			pendingThemeName = null;
-		} else {
-			pendingThemeName = themeName;
-		}
+		const elapsed = Date.now() - lastPreviewFired;
+		const delay = elapsed >= THROTTLE_INTERVAL_MS ? 0 : THROTTLE_INTERVAL_MS - elapsed;
 
-		throttleTimer = setTimeout(() => {
-			throttleTimer = null;
-			if (!pendingThemeName) return;
+		previewTimer = setTimeout(() => {
+			previewTimer = null;
 			lastPreviewFired = Date.now();
-			const pending = pendingThemeName;
+			const name = pendingThemeName;
 			pendingThemeName = null;
-			applyPreview(pending);
-		}, THROTTLE_INTERVAL_MS);
+			if (name) applyPreview(name);
+		}, delay);
 	};
 
 	const closeWithConfirm = (themeName: string, done: (value: void) => void): void => {
