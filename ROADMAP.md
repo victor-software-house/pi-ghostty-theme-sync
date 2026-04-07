@@ -124,34 +124,22 @@ cursor move → increment generation, reset debounce timer
 
 **Why this can't slow down or stutter:**
 
-- **No queue, no backlog.** Each cursor move cancels the previous debounce timer. Fast-scrolling through 50 themes produces exactly 1 preview — the last one.
+- **No queue, no backlog.** Debounce cancels all previous pending calls. Fast-scrolling through 50 themes produces exactly 1 preview — the last one.
 - **Pi repaint is synchronous.** `ctx.ui.setTheme()` repaints the TUI in the same tick. The user sees the update before any async work starts.
-- **cmux call is fire-and-forget.** We never `await` it. If the user moves again before cmux finishes, the old call completes harmlessly (cmux will just get overwritten by the next `set` call) and the new debounce fires for the latest theme.
-- **Generation counter as safety net.** A monotonically increasing counter is captured at debounce-fire time. If any async continuation checks and finds a newer generation, it bails. This prevents stale side effects if we ever add post-cmux logic.
-- **Theme generation is cached.** First access: read 475-byte file + hex math = <1ms. Subsequent: `Map.get()` = instant. The cache lives for the session — no repeated work.
+- **cmux call is fire-and-forget.** We never `await` it. If the user moves again before cmux finishes, the old call completes harmlessly and the next one overwrites it.
+- **Theme generation is cached.** First access: async read of 475-byte file + hex math = <1ms. Subsequent: `Map.get()` = instant.
 
 ```typescript
-// Pseudocode — the core mechanism
-let gen = 0;
-let timer: Timer;
+import { debounce } from "perfect-debounce";
 
-function onHighlight(name: string) {
-  gen++;                        // invalidate any in-flight work
-  clearTimeout(timer);          // cancel pending debounce
-  const myGen = gen;
-  timer = setTimeout(() => {    // returns immediately
-    (async () => {              // fully async from here — nothing blocks
-      if (myGen !== gen) return;
-      const theme = cache.get(name) ?? await generateAndCacheAsync(name);
-      if (myGen !== gen) return; // re-check after async file read
-      ctx.ui.setTheme(theme);    // sync repaint — intentional, this IS the update
-      execAsync(`cmux themes set "${name}"`).catch(noop);
-    })();
-  }, 80);
-}
-// onHighlight returns immediately. Zero blocking. All work is in the async IIFE.
-// File I/O (readFile) is async. Only ctx.ui.setTheme() is sync (intentional repaint).
-// Generation counter checked after every await to bail on stale work.
+const previewTheme = debounce(async (name: string) => {
+  const theme = cache.get(name) ?? await loadAndCache(name);
+  ctx.ui.setTheme(theme);
+  exec(`cmux themes set "${name}"`).catch(noop);
+}, 80);
+
+// in the picker component:
+selectList.onHighlight = (name) => { previewTheme(name); };
 ```
 
 ### Flow
