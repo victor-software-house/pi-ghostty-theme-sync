@@ -157,18 +157,81 @@ function previewTheme(name: string, ctx: ExtensionContext) {
    - `ctx.ui.setTheme(originalPiTheme)`
    - `exec("cmux themes set {originalCmuxTheme}")`
 
-### Component approach
+### Component architecture
 
-Two options. Decide during implementation:
+Custom picker built with `SelectList` + `Container` + `DynamicBorder` + `Text` from `@mariozechner/pi-tui`, plus `DynamicBorder` from `@mariozechner/pi-coding-agent`.
 
-**Option A: Use `ThemeSelectorComponent` directly.**
-Constructor: `new ThemeSelectorComponent(currentTheme, onSelect, onCancel, onPreview)`.
-Pro: zero custom UI code. Con: it only lists pi themes (calls `getAvailableThemes()`), not cmux themes. Would need to either subclass or pre-populate the pi themes dir.
+`ThemeSelectorComponent` (exported from pi-coding-agent) is NOT suitable — it calls `getAvailableThemes()` which lists pi themes, not cmux themes.
 
-**Option B: Build picker with `SelectList` + `Container` + `DynamicBorder`.**
-Same pattern as `pi-themes` extension. Pro: full control over theme list source (cmux dir). Con: ~40 lines of UI boilerplate.
+```
+/ghostty command handler
+  └─ ctx.ui.custom(factory, { overlay: true })
+       └─ ThemePicker component (extends Container)
+            ├─ DynamicBorder (top)
+            ├─ Text — title + current filter mode label
+            ├─ SelectList — scrollable theme list
+            │    ├─ onSelect → confirm
+            │    ├─ onCancel → revert + close
+            │    └─ onSelectionChange → debounced preview
+            ├─ Text — help line (keys)
+            └─ DynamicBorder (bottom)
+```
 
-**Recommendation: Option B.** We need to list cmux themes, not pi themes. The boilerplate is minimal — `pi-themes` already provides the exact pattern to copy.
+### Input handling
+
+`SelectList.handleInput` only handles arrows, enter, and escape. Typed characters are NOT passed through. The picker component must intercept `handleInput` and route keys:
+
+```typescript
+handleInput(data: string) {
+  if (matchesKey(data, Key.tab)) {
+    this.cycleFilterMode();           // dark → light → all → dark
+  } else if (matchesKey(data, Key.backspace)) {
+    this.searchText = this.searchText.slice(0, -1);
+    this.applyFilter();
+  } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+    this.searchText += data;          // printable char → append to search
+    this.applyFilter();
+  } else {
+    this.selectList.handleInput(data); // arrows, enter, escape → SelectList
+  }
+  tui.requestRender();
+}
+```
+
+### Filter modes (tab to cycle)
+
+Tab cycles through three filter modes: `all` → `dark` → `light` → `all`.
+
+Light/dark classification is determined at theme list build time by reading each theme file's `background` value and computing luminance. Threshold: `luminance < 0.5` = dark.
+
+```typescript
+type FilterMode = "all" | "dark" | "light";
+```
+
+`SelectList.setFilter(text)` does `startsWith` matching on `item.value`. For the combined text + mode filter:
+- Rebuild the `SelectList` items array when filter mode changes (swap out the full items list)
+- Use `setFilter(searchText)` for the text search within the current mode
+
+### Theme list items
+
+Built from `readdirSync(CMUX_THEME_DIR)` at picker open time. Each item includes a `description` showing "(dark)" or "(light)" based on bg luminance. The current cmux theme is marked "(current)".
+
+```typescript
+const items: SelectItem[] = themeNames.map(name => ({
+  value: name,
+  label: name,
+  description: [
+    name === currentCmuxTheme ? "(current)" : "",
+    isDark(name) ? "(dark)" : "(light)",
+  ].filter(Boolean).join(" "),
+}));
+```
+
+### Help line
+
+```
+/ search · tab dark|light|all · ↑↓ navigate · enter apply · esc cancel
+```
 
 ### Registration
 
