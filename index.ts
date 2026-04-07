@@ -5,19 +5,49 @@
  * Source of truth is cmux (`cmux themes list`) + cmux bundled theme files.
  */
 
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { DynamicBorder, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Container, Key, SelectList, Text, type SelectItem, matchesKey } from "@mariozechner/pi-tui";
 
 const CMUX_THEME_DIR = "/Applications/cmux.app/Contents/Resources/ghostty/themes";
+const PI_THEMES_DIR = join(homedir(), ".pi", "agent", "themes");
+const PREVIEW_THEME_NAME = "ghostty-sync-preview";
+const PREVIEW_THEME_FILE = `${PREVIEW_THEME_NAME}.json`;
+const THROTTLE_INTERVAL_MS = 100;
+
+type FilterMode = "all" | "dark" | "light";
 
 interface CmuxColors {
 	background: string;
 	foreground: string;
 	palette: Record<number, string>;
+}
+
+interface CmuxThemeEntry {
+	name: string;
+	colors: CmuxColors;
+	isDark: boolean;
+}
+
+type SessionContext = Parameters<Parameters<ExtensionAPI["on"]>[1]>[1];
+type CommandContext = Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
+
+function ensureThemesDir(): void {
+	if (!existsSync(PI_THEMES_DIR)) {
+		mkdirSync(PI_THEMES_DIR, { recursive: true });
+	}
+}
+
+function removePreviewThemeFile(): void {
+	try {
+		unlinkSync(join(PI_THEMES_DIR, PREVIEW_THEME_FILE));
+	} catch {
+		// Best-effort cleanup
+	}
 }
 
 function getCurrentCmuxThemeName(): string | null {
@@ -39,6 +69,12 @@ function getCurrentCmuxThemeName(): string | null {
 	}
 }
 
+function runCmuxThemeSet(themeName: string): void {
+	execFile("cmux", ["themes", "set", themeName], { timeout: 5000 }, () => {
+		// Fire-and-forget by design
+	});
+}
+
 function getCmuxThemeColors(themeName: string): CmuxColors | null {
 	try {
 		const themePath = join(CMUX_THEME_DIR, themeName);
@@ -47,6 +83,25 @@ function getCmuxThemeColors(themeName: string): CmuxColors | null {
 		return parseThemeConfig(output);
 	} catch {
 		return null;
+	}
+}
+
+function getAvailableCmuxThemes(): CmuxThemeEntry[] {
+	try {
+		const names = readdirSync(CMUX_THEME_DIR).sort((a, b) => a.localeCompare(b));
+		const entries: CmuxThemeEntry[] = [];
+		for (const name of names) {
+			const colors = getCmuxThemeColors(name);
+			if (!colors) continue;
+			entries.push({
+				name,
+				colors,
+				isDark: getLuminance(colors.background) < 0.5,
+			});
+		}
+		return entries;
+	} catch {
+		return [];
 	}
 }
 
@@ -299,10 +354,11 @@ function computeThemeHash(colors: CmuxColors): string {
 	return createHash("sha1").update(signature).digest("hex").slice(0, 8);
 }
 
-function cleanupOldGhosttyThemes(themesDir: string, keepFile: string): void {
+function cleanupOldGhosttyThemes(themesDir: string, keepFiles: string[]): void {
+	const keep = new Set(keepFiles);
 	try {
 		for (const file of readdirSync(themesDir)) {
-			if (file === keepFile) continue;
+			if (keep.has(file)) continue;
 			if (file === "ghostty-sync.json") {
 				unlinkSync(join(themesDir, file));
 				continue;
@@ -316,32 +372,287 @@ function cleanupOldGhosttyThemes(themesDir: string, keepFile: string): void {
 	}
 }
 
+function writeAndSetPiTheme(ctx: SessionContext, colors: CmuxColors, sourceThemeName: string): string {
+	ensureThemesDir();
+	const hash = computeThemeHash(colors);
+	const slug = slugifyThemeName(sourceThemeName);
+	const themeName = slug ? `ghostty-sync-${slug}` : `ghostty-sync-${hash}`;
+	const themeFile = `${themeName}.json`;
+	const themePath = join(PI_THEMES_DIR, themeFile);
+
+	const themeJson = generatePiTheme(colors, themeName);
+	writeFileSync(themePath, JSON.stringify(themeJson, null, 2));
+	cleanupOldGhosttyThemes(PI_THEMES_DIR, [themeFile]);
+
+	const result = ctx.ui.setTheme(themeName);
+	if (!result.success) {
+		ctx.ui.notify(`cmux theme sync failed: ${result.error}`, "error");
+	}
+	return themeName;
+}
+
+function writeAndSetPreviewTheme(ctx: SessionContext, colors: CmuxColors): void {
+	ensureThemesDir();
+	const previewPath = join(PI_THEMES_DIR, PREVIEW_THEME_FILE);
+	const previewJson = generatePiTheme(colors, PREVIEW_THEME_NAME);
+	writeFileSync(previewPath, JSON.stringify(previewJson, null, 2));
+	ctx.ui.setTheme(PREVIEW_THEME_NAME);
+}
+
+function isPrintableInput(data: string): boolean {
+	return data.length === 1 && data >= " " && data !== "\x7f";
+}
+
+function nextFilterMode(mode: FilterMode): FilterMode {
+	if (mode === "all") return "dark";
+	if (mode === "dark") return "light";
+	return "all";
+}
+
+function parseCommandThemeName(args: string): string {
+	const trimmed = args.trim();
+	if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+		return trimmed.slice(1, -1).trim();
+	}
+	return trimmed;
+}
+
+function syncCurrentCmuxThemeToPi(ctx: SessionContext): void {
+	const currentTheme = getCurrentCmuxThemeName();
+	if (!currentTheme) return;
+	const colors = getCmuxThemeColors(currentTheme);
+	if (!colors) return;
+	const themeName = slugifyThemeName(currentTheme)
+		? `ghostty-sync-${slugifyThemeName(currentTheme)}`
+		: `ghostty-sync-${computeThemeHash(colors)}`;
+	if (ctx.ui.theme.name === themeName) return;
+	writeAndSetPiTheme(ctx, colors, currentTheme);
+}
+
+async function showThemePicker(ctx: CommandContext): Promise<void> {
+	const entries = getAvailableCmuxThemes();
+	if (entries.length === 0) {
+		ctx.ui.notify("No cmux themes found", "warning");
+		return;
+	}
+
+	const entryByName = new Map(entries.map((entry) => [entry.name, entry]));
+	const originalPiTheme = ctx.ui.theme.name;
+	const originalCmuxTheme = getCurrentCmuxThemeName();
+
+	let filterMode: FilterMode = "all";
+	let searchText = "";
+	let selectedTheme = originalCmuxTheme && entryByName.has(originalCmuxTheme) ? originalCmuxTheme : entries[0]!.name;
+
+	let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+	let lastPreviewFired = 0;
+	let pendingThemeName: string | null = null;
+	let lastPreviewName: string | null = null;
+	let closed = false;
+
+	const clearThrottle = (): void => {
+		if (throttleTimer) {
+			clearTimeout(throttleTimer);
+			throttleTimer = null;
+		}
+		pendingThemeName = null;
+	};
+
+	const applyPreview = (themeName: string): void => {
+		if (closed || themeName === lastPreviewName) return;
+		const entry = entryByName.get(themeName);
+		if (!entry) return;
+		writeAndSetPreviewTheme(ctx, entry.colors);
+		runCmuxThemeSet(themeName);
+		lastPreviewName = themeName;
+	};
+
+	const schedulePreview = (themeName: string): void => {
+		if (closed) return;
+		const now = Date.now();
+		if (throttleTimer) clearTimeout(throttleTimer);
+
+		if (now - lastPreviewFired >= THROTTLE_INTERVAL_MS) {
+			lastPreviewFired = now;
+			applyPreview(themeName);
+			pendingThemeName = null;
+		} else {
+			pendingThemeName = themeName;
+		}
+
+		throttleTimer = setTimeout(() => {
+			throttleTimer = null;
+			if (!pendingThemeName) return;
+			lastPreviewFired = Date.now();
+			const pending = pendingThemeName;
+			pendingThemeName = null;
+			applyPreview(pending);
+		}, THROTTLE_INTERVAL_MS);
+	};
+
+	const closeWithConfirm = (themeName: string, done: (value: void) => void): void => {
+		if (closed) return;
+		closed = true;
+		clearThrottle();
+		removePreviewThemeFile();
+
+		const entry = entryByName.get(themeName);
+		if (!entry) {
+			ctx.ui.notify(`Theme not found: ${themeName}`, "error");
+			done(undefined);
+			return;
+		}
+
+		writeAndSetPiTheme(ctx, entry.colors, themeName);
+		runCmuxThemeSet(themeName);
+		done(undefined);
+	};
+
+	const closeWithCancel = (done: (value: void) => void): void => {
+		if (closed) return;
+		closed = true;
+		clearThrottle();
+		removePreviewThemeFile();
+
+		if (originalPiTheme) {
+			ctx.ui.setTheme(originalPiTheme);
+		}
+		if (originalCmuxTheme) {
+			runCmuxThemeSet(originalCmuxTheme);
+		}
+		done(undefined);
+	};
+
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+		const container = new Container();
+		let selectList: SelectList | null = null;
+
+		const getVisibleEntries = (): CmuxThemeEntry[] => {
+			const byMode = entries.filter((entry) => {
+				if (filterMode === "all") return true;
+				if (filterMode === "dark") return entry.isDark;
+				return !entry.isDark;
+			});
+			if (!searchText) return byMode;
+			const needle = searchText.toLowerCase();
+			return byMode.filter((entry) => entry.name.toLowerCase().includes(needle));
+		};
+
+		const buildSelectItems = (visibleEntries: CmuxThemeEntry[]): SelectItem[] => {
+			return visibleEntries.map((entry) => {
+				const tags: string[] = [];
+				if (entry.name === originalCmuxTheme) tags.push("current");
+				tags.push(entry.isDark ? "dark" : "light");
+				return {
+					value: entry.name,
+					label: entry.name,
+					description: tags.join(" · "),
+				};
+			});
+		};
+
+		const rebuild = (): void => {
+			const visibleEntries = getVisibleEntries();
+			const items = buildSelectItems(visibleEntries);
+
+			if (items.length > 0 && !items.some((item) => item.value === selectedTheme)) {
+				selectedTheme = items[0]!.value;
+			}
+
+			container.clear();
+			container.addChild(new DynamicBorder((s: string) => theme.fg("borderMuted", s)));
+			container.addChild(new Text(theme.fg("accent", theme.bold("Ghostty Theme Picker")), 1, 0));
+			container.addChild(new Text(theme.fg("dim", `Mode: ${filterMode} · Search: ${searchText || "—"}`), 1, 0));
+
+			selectList = new SelectList(items, 14, {
+				selectedPrefix: (text) => theme.fg("accent", text),
+				selectedText: (text) => theme.fg("accent", text),
+				description: (text) => theme.fg("muted", text),
+				scrollInfo: (text) => theme.fg("dim", text),
+				noMatch: (text) => theme.fg("warning", text),
+			});
+
+			const selectedIndex = items.findIndex((item) => item.value === selectedTheme);
+			if (selectedIndex >= 0) {
+				selectList.setSelectedIndex(selectedIndex);
+			}
+
+			selectList.onSelectionChange = (item) => {
+				selectedTheme = item.value;
+				schedulePreview(item.value);
+			};
+			selectList.onSelect = (item) => closeWithConfirm(item.value, done);
+			selectList.onCancel = () => closeWithCancel(done);
+
+			container.addChild(selectList);
+			container.addChild(
+				new Text(
+					theme.fg("dim", "type to search · backspace delete · tab all/dark/light · ↑↓ navigate · enter apply · esc cancel"),
+					1,
+					0
+				)
+			);
+			container.addChild(new DynamicBorder((s: string) => theme.fg("borderMuted", s)));
+		};
+
+		rebuild();
+		if (selectedTheme) {
+			schedulePreview(selectedTheme);
+		}
+
+		return {
+			render: (width: number) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => {
+				if (matchesKey(data, Key.tab)) {
+					filterMode = nextFilterMode(filterMode);
+					rebuild();
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, Key.backspace)) {
+					if (searchText.length > 0) {
+						searchText = searchText.slice(0, -1);
+						rebuild();
+						tui.requestRender();
+					}
+					return;
+				}
+				if (isPrintableInput(data)) {
+					searchText += data;
+					rebuild();
+					tui.requestRender();
+					return;
+				}
+				selectList?.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	}, { overlay: true });
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		const currentTheme = getCurrentCmuxThemeName();
-		if (!currentTheme) return;
+		syncCurrentCmuxThemeToPi(ctx);
+	});
 
-		const colors = getCmuxThemeColors(currentTheme);
-		if (!colors) return;
+	pi.registerCommand("ghostty", {
+		description: "Switch cmux + pi themes with live preview",
+		handler: async (args, ctx) => {
+			const themeArg = parseCommandThemeName(args);
+			if (themeArg) {
+				const colors = getCmuxThemeColors(themeArg);
+				if (!colors) {
+					ctx.ui.notify(`Unknown cmux theme: ${themeArg}`, "error");
+					return;
+				}
+				removePreviewThemeFile();
+				writeAndSetPiTheme(ctx, colors, themeArg);
+				runCmuxThemeSet(themeArg);
+				return;
+			}
 
-		const themesDir = join(homedir(), ".pi", "agent", "themes");
-		if (!existsSync(themesDir)) mkdirSync(themesDir, { recursive: true });
-
-		const hash = computeThemeHash(colors);
-		const slug = slugifyThemeName(currentTheme);
-		const themeName = slug ? `ghostty-sync-${slug}` : `ghostty-sync-${hash}`;
-		const themeFile = `${themeName}.json`;
-		const themePath = join(themesDir, themeFile);
-
-		if (ctx.ui.theme.name === themeName) return;
-
-		const themeJson = generatePiTheme(colors, themeName);
-		writeFileSync(themePath, JSON.stringify(themeJson, null, 2));
-		cleanupOldGhosttyThemes(themesDir, themeFile);
-
-		const result = ctx.ui.setTheme(themeName);
-		if (!result.success) {
-			ctx.ui.notify(`cmux theme sync failed: ${result.error}`, "error");
-		}
+			await showThemePicker(ctx);
+		},
 	});
 }

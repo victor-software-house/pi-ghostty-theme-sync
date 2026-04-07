@@ -4,27 +4,36 @@ Sync [pi](https://github.com/badlogic/pi-mono) theme with your active [Ghostty](
 
 ![demo](assets/demo.gif)
 
-On startup, the extension runs `ghostty +show-config`, generates a pi theme, and switches pi to it.
+On startup, the extension reads the active cmux theme (`cmux themes list`), loads the matching theme file from cmux, generates a pi theme, and switches pi to it.
 
 ## install
 
 ```bash
-pi install npm:@ogulcancelik/pi-ghostty-theme-sync
+pi install git:git@github.com:victor-software-house/pi-ghostty-theme-sync
 ```
 
 (Optional, try without installing):
 
 ```bash
-pi -e npm:@ogulcancelik/pi-ghostty-theme-sync
+pi -e git:git@github.com:victor-software-house/pi-ghostty-theme-sync
 ```
+
+## commands
+
+- `/ghostty` — open interactive picker (overlay) with live preview
+  - type to search
+  - `tab` cycles filters: `all → dark → light`
+  - `↑/↓` navigate, `enter` apply, `esc` cancel/revert
+- `/ghostty <theme name>` — apply a specific cmux theme directly
 
 ## how it works
 
-- Reads: `background`, `foreground`, and `palette[0..15]` from Ghostty.
-- Computes a hash of `bg/fg + palette[0..15]`.
-- Writes a theme to: `~/.pi/agent/themes/ghostty-sync-<hash>.json`.
-- Removes older `ghostty-sync-*.json` files (keeps only the current one).
-- Sets pi theme to `ghostty-sync-<hash>`.
+- Reads active theme from `cmux themes list`.
+- Loads theme files from: `/Applications/cmux.app/Contents/Resources/ghostty/themes`.
+- Maps `background`, `foreground`, `palette[0..15]` to a pi theme.
+- Writes pi themes to: `~/.pi/agent/themes/ghostty-sync-<slug>.json`.
+- Uses a preview file for live picker: `~/.pi/agent/themes/ghostty-sync-preview.json`.
+- Keeps only the latest synced theme file (`ghostty-sync-*.json`) after apply.
 
 ## mapping notes
 
@@ -41,7 +50,9 @@ Neutrals (`muted`, `dim`, subtle borders) are derived from `background` + `foreg
 
 ## requirements
 
-- Ghostty installed and `ghostty` available in `PATH`
+- cmux installed and `cmux` available in `PATH`
+- cmux app theme directory available at:
+  `/Applications/cmux.app/Contents/Resources/ghostty/themes`
 
 ## license
 
