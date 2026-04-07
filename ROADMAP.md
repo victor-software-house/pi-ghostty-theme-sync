@@ -84,45 +84,97 @@ Add `AGENTS.md` with extension-specific guidance for future development.
 
 The main feature. A `/ghostty` slash command that opens an interactive theme picker with **real-time preview** of both Ghostty and pi simultaneously.
 
+### Theme data source
+
+Ghostty ships ~463 theme files at:
+```
+/Applications/Ghostty.app/Contents/Resources/ghostty/themes/
+```
+
+Each file is exactly 475 bytes — 16 palette entries + bg/fg/cursor/selection. Simple `key = value` format, trivially parseable. No subprocess needed to read them.
+
+cmux may have its own copy at a similar path under `/Applications/cmux.app/...`. Discover at runtime; fall back to the Ghostty app bundle.
+
+### Loading strategy: lazy with in-memory cache
+
+**Decision:** Do NOT pre-bundle converted themes or generate all at startup.
+
+- **At startup:** scan the themes directory for file names only → build `string[]` of theme names. Cost: one `readdirSync`, sub-millisecond.
+- **On picker open:** theme list is already available, render immediately.
+- **On cursor highlight:** read the 475-byte theme file, parse 22 lines of `key = value`, run `generatePiTheme()` (pure hex math). Cache the result in a `Map<string, Theme>`. Total cost per uncached theme: <1ms.
+- **Subsequent visits to same theme:** cache hit, zero computation.
+
+Why not pre-bundle:
+- 463 files get stale when Ghostty/cmux updates its theme library
+- Adds a build step and package bloat for zero perceptible benefit
+- The theme files are already on disk and trivially fast to parse
+
+### Preview pipeline (debounced, non-blocking)
+
+The preview must update both Ghostty (terminal) and pi (TUI) simultaneously as the user navigates. Both updates happen asynchronously so the picker UI never blocks.
+
+```
+cursor move → debounce(80ms) → async preview:
+  1. ctx.ui.setTheme(cachedPiTheme)    — sync, instant pi repaint
+  2. execAsync("cmux themes set ...")   — async, fire-and-forget IPC
+```
+
+**Key design points:**
+
+- **Debounce cursor moves at ~80ms.** Fast arrow-key scrolling doesn't fire 30 previews. Only the last highlighted theme triggers a preview after the user pauses.
+- **Pi theme first, Ghostty second.** `setTheme()` is synchronous and repaints the TUI instantly — the user sees the pi side update before the async `cmux` call even starts. This makes the picker feel responsive even if cmux IPC takes 20-50ms.
+- **`cmux themes set` is fire-and-forget.** We don't `await` it to unblock the UI. If the user moves again before cmux finishes, the debounce cancels the stale preview and only the latest one runs.
+- **No `ghostty +show-config` in the preview loop.** We read colors directly from the theme files on disk — no subprocess per preview. The only subprocess is `cmux themes set` (IPC over unix socket, fast).
+- **Cancel in-flight previews.** Each debounced preview gets an `AbortController` or generation counter. If a newer preview fires, the old one's cmux call is abandoned (or its result ignored).
+
 ### Flow
 
 1. User types `/ghostty` (or `/ghostty themes`)
-2. Extension opens a picker overlay listing all Ghostty themes (via `cmux themes list`)
-3. As user navigates the list (arrow keys), each highlighted theme:
-   a. Calls `cmux themes set "{name}"` — Ghostty repaints instantly
-   b. Reads new palette via `ghostty +show-config`
-   c. Generates pi theme in-memory
-   d. Calls `ctx.ui.setTheme(themeObj)` — pi repaints instantly
-4. On confirm (enter): persist the choice, write theme JSON file, done
-5. On cancel (escape): revert to previous theme (both Ghostty and pi)
+2. Extension opens a picker overlay (`ctx.ui.custom` with `SelectList`)
+3. Theme list populated from cached directory scan
+4. As user navigates (arrow keys):
+   a. Debounce fires after 80ms pause
+   b. Read theme file from disk (475 bytes, cached after first read)
+   c. Generate pi theme object via `generatePiTheme()` (cached after first gen)
+   d. `ctx.ui.setTheme(themeObj)` — pi repaints instantly (sync)
+   e. `execAsync("cmux themes set ...")` — Ghostty repaints (async, non-blocking)
+5. On confirm (enter):
+   - Write final theme JSON to `~/.pi/agent/themes/ghostty-sync-{slug}.json`
+   - Persist the choice in pi settings
+6. On cancel (escape):
+   - Revert pi theme to the one captured before picker opened
+   - Revert Ghostty via `cmux themes set "{original}"`
 
-### Implementation
+### Component architecture
 
-- `pi.registerCommand("ghostty", { ... })` — entry point
-- Use `ctx.ui.custom(factory, { overlay: true })` for the picker component
-- The picker component:
-  - Fetches theme list once via `cmux themes list`
-  - Renders a scrollable list with search/filter
-  - On cursor move: triggers the preview pipeline (cmux set → ghostty read → pi set)
-  - Tracks original theme for revert on cancel
-- Preview pipeline must be fast — debounce cursor moves (~100ms) to avoid thrashing
+```
+/ghostty command handler
+  └─ ctx.ui.custom(factory, { overlay: true })
+       └─ ThemePicker component
+            ├─ SelectList — scrollable, filterable theme list
+            ├─ DynamicBorder + header/footer chrome
+            ├─ onHighlight(themeName) callback
+            │    └─ debounced previewTheme(themeName)
+            │         ├─ getOrGeneratePiTheme(themeName)  ← lazy cache
+            │         ├─ ctx.ui.setTheme(theme)           ← sync
+            │         └─ execAsync("cmux themes set")     ← async
+            ├─ onSelect(themeName) → persist + done
+            └─ onCancel() → revert + done
+```
 
-### Performance concern
+### SelectList highlight tracking
 
-The preview pipeline involves 2 subprocess calls per theme change:
-1. `cmux themes set` (fast — IPC over unix socket)
-2. `ghostty +show-config` (slower — spawns process, reads all config)
-
-If `ghostty +show-config` is too slow for real-time preview, consider:
-- Pre-reading all theme palettes at startup into a cache
-- Or: `ghostty +list-themes` + reading theme files directly from Ghostty's resources dir at `/Applications/Ghostty.app/Contents/Resources/ghostty/themes/` (or cmux equivalent)
-- Theme files are simple `key = value` format, trivially parseable
+`pi-themes` uses `SelectList` from `@mariozechner/pi-tui`. Need to verify if it exposes an `onHighlight` callback or equivalent for cursor-move events (not just `onSelect`/`onCancel`). If not, options:
+- Wrap `handleInput` to detect cursor position changes after each input
+- Build a custom list component
+- Contribute `onHighlight` upstream to `pi-tui`
 
 ### Stretch: search and categories
 
-- Fuzzy search filter in the picker
-- Light/dark grouping (detect by bg luminance)
+- Fuzzy search filter in the picker (SelectList may already support this)
+- Light/dark grouping (detect by bg luminance from cached theme data)
 - Recently used themes at the top
+- Show a color swatch preview next to each theme name (bg/fg/accent dots)
 
 ---
 
