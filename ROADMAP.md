@@ -40,6 +40,42 @@ user picks theme in /ghostty TUI  →  cmux themes set "{name}"
 
 **Critical:** The mitchellh ghostty config (`~/Library/Application Support/com.mitchellh.ghostty/config`) must NEVER contain hardcoded `background`, `foreground`, `cursor-color`, `cursor-text`, `selection-background`, or `selection-foreground` values. These override the theme's colors and break `cmux themes set`.
 
+### Validated benchmarks
+
+`cmux themes set` — 300 iterations across 30 themes, 10 rounds each:
+
+| metric | value |
+|---|---|
+| min | 37ms |
+| avg | 41.9ms |
+| p50 | 40ms |
+| p95 | 57ms |
+| p99 | 73ms |
+| max | 77ms |
+
+100% success rate. Even p99 (73ms) fits within the 80ms debounce window.
+**Debounce set to 100ms** to give comfortable headroom above p99.
+
+### Validated via probe (runtime API)
+
+| finding | detail |
+|---|---|
+| `ctx.ui.setTheme(Theme)` | ✘ Fails — only accepts string name |
+| `ctx.ui.setTheme("name")` | ✔ 16ms — looks up theme from disk, repaints |
+| `writeFileSync` theme JSON | ✔ <1ms |
+| **pi side total (write + setTheme)** | **~17ms** |
+| **full preview (pi 17ms + cmux 40ms)** | **~57ms** |
+| `ThemeSelectorComponent` | ✔ Exported from `@mariozechner/pi-coding-agent`. Has `onPreview` callback via `onSelectionChange`. Extends `Container`, uses `SelectList` internally. |
+| `Theme` constructor | Takes `(fgColors, bgColors, mode, options)` — can construct directly but `setTheme` won't accept it |
+| External deps needed | None — `ThemeSelectorComponent`, `SelectList`, `DynamicBorder`, `Container` all available from pi-coding-agent / pi-tui |
+
+**Phase 2 approach (simplified):**
+- Write generated theme JSON to `~/.pi/agent/themes/ghostty-sync-preview.json`
+- Call `ctx.ui.setTheme("ghostty-sync-preview")` (17ms)
+- Fire-and-forget `cmux themes set` (40ms)
+- Reuse or extend `ThemeSelectorComponent` for the picker UI
+- No `perfect-debounce` or `p-memoize` — keep it native
+
 ---
 
 ## Phase 1 — quality fixes (no new features)
