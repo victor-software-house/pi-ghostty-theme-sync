@@ -29,14 +29,16 @@ user picks theme in /ghostty TUI  →  cmux themes set "{name}"
 
 | API | What it does |
 |---|---|
+| `cmux themes set "Name"` | Changes theme live (~20ms, auto-reloads) |
 | `cmux themes list` | Lists all available themes, marks current light/dark |
-| `cmux themes set "Name"` | Changes theme live with instant preview |
-| `cmux reload-config` | Reloads Ghostty config from disk programmatically |
+| `cmux reload-config` | Reloads config from disk (not needed for theme switch) |
 | `ctx.ui.setTheme(name \| Theme)` | Sets pi theme instantly (full TUI repaint) |
 | `ctx.ui.getAllThemes()` | Lists available pi themes with paths |
 | `ctx.ui.select(title, options)` | Simple picker dialog |
 | `ctx.ui.custom(factory, { overlay })` | Full custom overlay component with keyboard focus |
 | `pi.registerCommand(name, opts)` | Registers a `/slash` command |
+
+**Critical:** The mitchellh ghostty config (`~/Library/Application Support/com.mitchellh.ghostty/config`) must NEVER contain hardcoded `background`, `foreground`, `cursor-color`, `cursor-text`, `selection-background`, or `selection-foreground` values. These override the theme's colors and break `cmux themes set`.
 
 ---
 
@@ -137,7 +139,7 @@ const getTheme = pMemoize((name: string) => loadThemeFromDisk(name));
 
 const previewTheme = debounce(async (name: string) => {
   ctx.ui.setTheme(await getTheme(name));
-  exec(`cmux themes set "${name}"`).catch(noop);
+  exec(`cmux themes set "${name}"`).catch(noop);  // ~20ms, auto-reloads
 }, 80);
 
 // in the picker component:
