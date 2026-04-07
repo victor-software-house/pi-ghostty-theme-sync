@@ -108,23 +108,45 @@ Why not pre-bundle:
 - Adds a build step and package bloat for zero perceptible benefit
 - The theme files are already on disk and trivially fast to parse
 
-### Preview pipeline (debounced, non-blocking)
+### Preview pipeline (latest-wins, non-blocking)
 
-The preview must update both Ghostty (terminal) and pi (TUI) simultaneously as the user navigates. Both updates happen asynchronously so the picker UI never blocks.
+The preview must update both cmux (terminal) and pi (TUI) simultaneously as the user navigates. The UI must never block or stutter, even during fast scrolling.
+
+**Pattern: latest-wins single slot with generation counter.** No queue (FIFO or LIFO). Each cursor move overwrites the pending preview. Only the most recent theme ever gets processed.
 
 ```
-cursor move → debounce(80ms) → async preview:
-  1. ctx.ui.setTheme(cachedPiTheme)    — sync, instant pi repaint
-  2. execAsync("cmux themes set ...")   — async, fire-and-forget IPC
+cursor move → increment generation, reset debounce timer
+             └─ after 80ms idle:
+                  1. generate pi theme (sync, <1ms, cached)
+                  2. ctx.ui.setTheme(piTheme)           — sync, instant repaint
+                  3. execAsync("cmux themes set ...")    — fire-and-forget, no await
 ```
 
-**Key design points:**
+**Why this can't slow down or stutter:**
 
-- **Debounce cursor moves at ~80ms.** Fast arrow-key scrolling doesn't fire 30 previews. Only the last highlighted theme triggers a preview after the user pauses.
-- **Pi theme first, Ghostty second.** `setTheme()` is synchronous and repaints the TUI instantly — the user sees the pi side update before the async `cmux` call even starts. This makes the picker feel responsive even if cmux IPC takes 20-50ms.
-- **`cmux themes set` is fire-and-forget.** We don't `await` it to unblock the UI. If the user moves again before cmux finishes, the debounce cancels the stale preview and only the latest one runs.
-- **No `ghostty +show-config` in the preview loop.** We read colors directly from the theme files on disk — no subprocess per preview. The only subprocess is `cmux themes set` (IPC over unix socket, fast).
-- **Cancel in-flight previews.** Each debounced preview gets an `AbortController` or generation counter. If a newer preview fires, the old one's cmux call is abandoned (or its result ignored).
+- **No queue, no backlog.** Each cursor move cancels the previous debounce timer. Fast-scrolling through 50 themes produces exactly 1 preview — the last one.
+- **Pi repaint is synchronous.** `ctx.ui.setTheme()` repaints the TUI in the same tick. The user sees the update before any async work starts.
+- **cmux call is fire-and-forget.** We never `await` it. If the user moves again before cmux finishes, the old call completes harmlessly (cmux will just get overwritten by the next `set` call) and the new debounce fires for the latest theme.
+- **Generation counter as safety net.** A monotonically increasing counter is captured at debounce-fire time. If any async continuation checks and finds a newer generation, it bails. This prevents stale side effects if we ever add post-cmux logic.
+- **Theme generation is cached.** First access: read 475-byte file + hex math = <1ms. Subsequent: `Map.get()` = instant. The cache lives for the session — no repeated work.
+
+```typescript
+// Pseudocode — the core mechanism
+let gen = 0;
+let timer: Timer;
+
+function onHighlight(name: string) {
+  gen++;
+  const myGen = gen;
+  clearTimeout(timer);
+  timer = setTimeout(() => {
+    if (myGen !== gen) return;  // superseded during debounce window
+    const theme = cache.get(name) ?? generateAndCache(name);
+    ctx.ui.setTheme(theme);                          // sync
+    execAsync(`cmux themes set "${name}"`).catch(noop); // async, no await
+  }, 80);
+}
+```
 
 ### Flow
 
