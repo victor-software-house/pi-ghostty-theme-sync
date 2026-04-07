@@ -131,10 +131,12 @@ cursor move → increment generation, reset debounce timer
 
 ```typescript
 import { debounce } from "perfect-debounce";
+import pMemoize from "p-memoize";
+
+const getTheme = pMemoize((name: string) => loadThemeFromDisk(name));
 
 const previewTheme = debounce(async (name: string) => {
-  const theme = cache.get(name) ?? await loadAndCache(name);
-  ctx.ui.setTheme(theme);
+  ctx.ui.setTheme(await getTheme(name));
   exec(`cmux themes set "${name}"`).catch(noop);
 }, 80);
 
